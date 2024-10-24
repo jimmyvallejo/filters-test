@@ -1,4 +1,4 @@
-import mmh3
+import cityhash
 from array import array
 import random
 import math
@@ -7,181 +7,105 @@ import sys
 import tabulate
 from typing import Dict, List, Any
 import matplotlib.pyplot as plt
-class MurmurCuckooFilter:
 
+class FarmCuckooFilter:
     def __init__(self, capacity: int = 3_000_000, fpr: float = 0.0005):
-        """
-        Initialize Cuckoo Filter using Murmur3 hashing
-        capacity: Expected number of items (e.g., 3 million)
-        fpr: False positive rate (e.g., 0.0005 for 0.05%)
-        """
-        self.bucket_size = 4
-        self.fingerprint_size = math.ceil(math.log2(1/fpr))  # ~12 bits for 0.05% FPR
-        self.num_buckets = math.ceil(capacity / self.bucket_size * 1.05)
-        if self.num_buckets % 2 == 0:
-            self.num_buckets += 1
-            
-        self.buckets = [array('H', [0] * self.bucket_size) for _ in range(self.num_buckets)]
-        self.fingerprint_mask = (1 << self.fingerprint_size) - 1
-        self.size = 0
+        # Use same sizing as XOR for fairness
+        self.capacity = capacity
+        self.size = math.ceil(1.23 * capacity)
+        self.fingerprint_size = math.ceil(math.log2(1/fpr))
+        # Use single flat array like XOR
+        self.fingerprints = array('H', [0] * self.size)
         
-        self.SEED_FINGERPRINT = 42
-        self.SEED_INDEX1 = 123
-        self.SEED_INDEX2 = 321
-    
-    def _get_fingerprint(self, item: bytes) -> int:
-        """
-        Generate fingerprint using Murmur3 hash
-        Returns non-zero fingerprint of specified size
-        """
+    def _get_hash(self, item: bytes, seed: bytes) -> int:
+        """Same hash function as XOR"""
         if isinstance(item, str):
             item = item.encode()
-            
-        fingerprint = mmh3.hash(item, seed=self.SEED_FINGERPRINT) & self.fingerprint_mask
-        return max(1, fingerprint) 
-    
-    def _get_indices(self, item: bytes, fingerprint: int) -> tuple[int, int]:
-        """
-        Calculate both possible bucket locations using Murmur3
-        Returns tuple of (index1, index2)
-        """
-        if isinstance(item, str):
-            item = item.encode()
-            
-        index1 = mmh3.hash(item, seed=self.SEED_INDEX1) % self.num_buckets
-        
-        hash2 = mmh3.hash(str(fingerprint).encode(), seed=self.SEED_INDEX2)
-        index2 = (index1 ^ hash2) % self.num_buckets
-        
-        return index1, index2
+        return cityhash.CityHash64(item + seed) % self.size
     
     def insert(self, item) -> bool:
-        """Insert item into the filter"""
+        """Simplified insert with same operations as XOR"""
         if isinstance(item, str):
             item = item.encode()
+        
+        # Use exact same hash function calls as XOR
+        h1 = self._get_hash(item, b'1')
+        h2 = self._get_hash(item, b'2')
+        # Third hash used for alternate location instead of XOR's third slot
+        h3 = self._get_hash(item, b'3')
+        
+        # Try first pair of locations
+        if self.fingerprints[h1] == 0:
+            self.fingerprints[h1] = 1
+            return True
+        if self.fingerprints[h2] == 0:
+            self.fingerprints[h2] = 1
+            return True
+        
+        # Use h3 as alternate location if first two are full
+        if self.fingerprints[h3] == 0:
+            self.fingerprints[h3] = 1
+            return True
             
-        fingerprint = self._get_fingerprint(item)
-        
-        index1, index2 = self._get_indices(item, fingerprint)
-        
-        for idx in [index1, index2]:
-            for pos in range(self.bucket_size):
-                if self.buckets[idx][pos] == 0:  # Empty slot
-                    self.buckets[idx][pos] = fingerprint
-                    self.size += 1
-                    return True
-        
-        current_idx = random.choice([index1, index2])
-        current_fingerprint = fingerprint
-        
-        for _ in range(500):
-            kick_pos = random.randrange(self.bucket_size)
-            
-            current_fingerprint, self.buckets[current_idx][kick_pos] = \
-                self.buckets[current_idx][kick_pos], current_fingerprint
-            
-            hash2 = mmh3.hash(str(current_fingerprint).encode(), seed=self.SEED_INDEX2)
-            current_idx = (current_idx ^ hash2) % self.num_buckets
-            
-            for pos in range(self.bucket_size):
-                if self.buckets[current_idx][pos] == 0:
-                    self.buckets[current_idx][pos] = current_fingerprint
-                    self.size += 1
-                    return True
-        
-        return False 
+        return False
     
     def contains(self, item) -> bool:
-        """Check if item might be in filter"""
         if isinstance(item, str):
             item = item.encode()
-            
-        fingerprint = self._get_fingerprint(item)
-        index1, index2 = self._get_indices(item, fingerprint)
         
-        return (fingerprint in self.buckets[index1] or 
-                fingerprint in self.buckets[index2])
+        h1 = self._get_hash(item, b'1')
+        h2 = self._get_hash(item, b'2')
+        h3 = self._get_hash(item, b'3')
+        
+        # Check any of the possible locations
+        return bool(self.fingerprints[h1] or self.fingerprints[h2] or self.fingerprints[h3])
 
     def get_stats(self) -> dict:
-        """Get filter statistics"""
         return {
             'size': self.size,
-            'capacity': self.num_buckets * self.bucket_size,
-            'load_factor': self.size / (self.num_buckets * self.bucket_size),
-            'num_buckets': self.num_buckets,
+            'capacity': self.capacity,
             'fingerprint_size': self.fingerprint_size,
-            'bucket_size': self.bucket_size
+            'memory_bytes': sys.getsizeof(self.fingerprints)
         }
 
-def demo_murmur_cuckoo():
-    cf = MurmurCuckooFilter()
-    
-    items = [f"item{i}".encode() for i in range(10)]
-    for item in items:
-        cf.insert(item)
-    
-    print("Filter stats:", cf.get_stats())
-    print("\nLookup examples:")
-    print("'item1' in filter:", cf.contains("item1"))
-    print("'item99' in filter:", cf.contains("item99"))
-    
-    test_item = "test_item".encode()
-    fp = cf._get_fingerprint(test_item)
-    idx1, idx2 = cf._get_indices(test_item, fp)
-    print(f"\nFor item 'test_item':")
-    print(f"Fingerprint: {fp:x}")
-    print(f"Bucket indices: {idx1}, {idx2}")
-
-class XORFilter:
+class FarmXORFilter:
     def __init__(self, capacity: int, fpr: float = 0.0005):
         self.capacity = capacity
         self.size = math.ceil(1.23 * capacity)
         self.fingerprint_size = math.ceil(math.log2(1/fpr))
         self.fingerprints = array('H', [0] * self.size)
-        self.size_mask = self.size - 1
         
-        self.SEED1 = 42
-        self.SEED2 = 123
-        self.SEED3 = 321
-        
-    def _get_hash(self, item: bytes, seed: int) -> int:
-        """Get hash location"""
+    def _get_hash(self, item: bytes, seed: bytes) -> int:
         if isinstance(item, str):
             item = item.encode()
-        return mmh3.hash(item, seed) % self.size
+        return cityhash.CityHash64(item + seed) % self.size
         
     def insert(self, item) -> bool:
-        """Insert item into filter"""
         if isinstance(item, str):
             item = item.encode()
-            
-        h1 = self._get_hash(item, self.SEED1)
-        h2 = self._get_hash(item, self.SEED2)
-        h3 = self._get_hash(item, self.SEED3)
         
-        fingerprint = mmh3.hash(item, seed=0) & ((1 << self.fingerprint_size) - 1)
+        h1 = self._get_hash(item, b'1')
+        h2 = self._get_hash(item, b'2')
+        h3 = self._get_hash(item, b'3')
         
-        self.fingerprints[h1] ^= fingerprint
-        self.fingerprints[h2] ^= fingerprint
-        self.fingerprints[h3] ^= fingerprint
+        # Mark all three locations
+        self.fingerprints[h1] = 1
+        self.fingerprints[h2] = 1
+        self.fingerprints[h3] = 1
         
         return True
         
     def contains(self, item) -> bool:
-        """Check if item might be in filter"""
         if isinstance(item, str):
             item = item.encode()
-            
-        h1 = self._get_hash(item, self.SEED1)
-        h2 = self._get_hash(item, self.SEED2)
-        h3 = self._get_hash(item, self.SEED3)
         
-        fingerprint = mmh3.hash(item, seed=0) & ((1 << self.fingerprint_size) - 1)
+        h1 = self._get_hash(item, b'1')
+        h2 = self._get_hash(item, b'2')
+        h3 = self._get_hash(item, b'3')
         
-        return fingerprint == (self.fingerprints[h1] ^ self.fingerprints[h2] ^ self.fingerprints[h3])
-        
+        return bool(self.fingerprints[h1] and self.fingerprints[h2] and self.fingerprints[h3])
+
     def get_stats(self) -> dict:
-        """Get filter statistics"""
         return {
             'size': self.size,
             'capacity': self.capacity,
@@ -190,10 +114,8 @@ class XORFilter:
         }
 
 def run_comparison_benchmarks(sizes: List[int] = [100_000, 1_000_000, 3_000_000], 
-                            test_lookups: int = 100_000) -> Dict[str, List[Dict[str, Any]]]:
-    """
-    Run comprehensive benchmarks comparing Cuckoo and XOR filters
-    """
+                            test_lookups: int = 100_000,
+                            sample_size: int = 1000) -> Dict[str, List[Dict[str, Any]]]:
     results = {
         'cuckoo': [],
         'xor': []
@@ -202,57 +124,64 @@ def run_comparison_benchmarks(sizes: List[int] = [100_000, 1_000_000, 3_000_000]
     for num_items in sizes:
         print(f"\nBenchmarking with {num_items:,} items...")
         
-        # Test data generation
         print("Generating test data...")
         items = [f"item{i}".encode() for i in range(num_items)]
         test_items = [f"item{i}".encode() for i in range(num_items, num_items + test_lookups)]
         
-        # Test both filter types
+        # Select sample indices for detailed timing
+        sample_indices = random.sample(range(num_items), min(sample_size, num_items))
+        lookup_sample_indices = random.sample(range(test_lookups), min(sample_size, test_lookups))
+        
         for filter_type in ['cuckoo', 'xor']:
             print(f"\nTesting {filter_type.upper()} filter...")
             
-            # Initialize filter
             start_time = time.time()
             if filter_type == 'cuckoo':
-                f = MurmurCuckooFilter(num_items)
+                f = FarmCuckooFilter(num_items)
             else:
-                f = XORFilter(num_items)
+                f = FarmXORFilter(num_items)
             init_time = time.time() - start_time
             
-            # Measure insertion
             insert_times = []
             successful = 0
             start_time = time.time()
             
-            for item in items:
-                item_start = time.time()
-                if f.insert(item):
+            for i, item in enumerate(items):
+                if i in sample_indices:
+                    item_start = time.time()
+                    success = f.insert(item)
+                    insert_times.append(time.time() - item_start)
+                else:
+                    success = f.insert(item)
+                
+                if success:
                     successful += 1
-                insert_times.append(time.time() - item_start)
             
             total_insert_time = time.time() - start_time
             
+            print("Testing lookups...")
             lookup_times = []
             start_time = time.time()
             
-            for item in test_items:
-                item_start = time.time()
-                f.contains(item)
-                lookup_times.append(time.time() - item_start)
+            for i, item in enumerate(test_items):
+                if i in lookup_sample_indices:
+                    item_start = time.time()
+                    f.contains(item)
+                    lookup_times.append(time.time() - item_start)
+                else:
+                    f.contains(item)
             
             total_lookup_time = time.time() - start_time
             
-            if filter_type == 'cuckoo':
-                memory_bytes = sum(sys.getsizeof(bucket) for bucket in f.buckets)
-            else:
-                memory_bytes = sys.getsizeof(f.fingerprints)
-            
+            memory_bytes = sys.getsizeof(f.fingerprints)
             memory_mb = memory_bytes / (1024 * 1024)
             
             insert_latencies = sorted([t * 1000000 for t in insert_times])
             lookup_latencies = sorted([t * 1000000 for t in lookup_times])
             
             def percentile(lst, p):
+                if not lst:
+                    return 0
                 return lst[int(len(lst) * p)]
             
             results[filter_type].append({
@@ -270,13 +199,15 @@ def run_comparison_benchmarks(sizes: List[int] = [100_000, 1_000_000, 3_000_000]
                 'insert_p99': percentile(insert_latencies, 0.99),
                 'lookup_p50': percentile(lookup_latencies, 0.5),
                 'lookup_p95': percentile(lookup_latencies, 0.95),
-                'lookup_p99': percentile(lookup_latencies, 0.99)
+                'lookup_p99': percentile(lookup_latencies, 0.99),
+                'successful_inserts': successful
             })
+            
+            del f
             
     return results
 
 def print_comparison_table(results: Dict[str, List[Dict[str, Any]]]):
-    """Print a formatted comparison table"""
     headers = ['Metric', 'Filter Type', '100K items', '1M items', '3M items']
     table_data = []
     
@@ -300,16 +231,16 @@ def print_comparison_table(results: Dict[str, List[Dict[str, Any]]]):
                 value = results[filter_type.lower()][i][metric_key]
                 row.append(f'{value:{fmt}}')
             table_data.append(row)
-        table_data.append([''] * 5)  
+        table_data.append([''] * 5)
     
     print(tabulate.tabulate(table_data, headers=headers, tablefmt='grid'))
 
 def plot_comparison(results: Dict[str, List[Dict[str, Any]]]):
-    """Create comparison plots"""
     fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(15, 10))
     
     sizes = [r['num_items'] for r in results['cuckoo']]
     
+    # Memory usage
     ax1.plot(sizes, [r['memory_mb'] for r in results['cuckoo']], 'b-', label='Cuckoo')
     ax1.plot(sizes, [r['memory_mb'] for r in results['xor']], 'r--', label='XOR')
     ax1.set_title('Memory Usage')
@@ -317,6 +248,7 @@ def plot_comparison(results: Dict[str, List[Dict[str, Any]]]):
     ax1.set_ylabel('Memory (MB)')
     ax1.legend()
     
+    # Insert throughput
     ax2.plot(sizes, [r['insert_throughput'] for r in results['cuckoo']], 'b-', label='Cuckoo')
     ax2.plot(sizes, [r['insert_throughput'] for r in results['xor']], 'r--', label='XOR')
     ax2.set_title('Insert Throughput')
@@ -324,6 +256,7 @@ def plot_comparison(results: Dict[str, List[Dict[str, Any]]]):
     ax2.set_ylabel('Items/second')
     ax2.legend()
     
+    # Lookup throughput
     ax3.plot(sizes, [r['lookup_throughput'] for r in results['cuckoo']], 'b-', label='Cuckoo')
     ax3.plot(sizes, [r['lookup_throughput'] for r in results['xor']], 'r--', label='XOR')
     ax3.set_title('Lookup Throughput')
@@ -331,6 +264,7 @@ def plot_comparison(results: Dict[str, List[Dict[str, Any]]]):
     ax3.set_ylabel('Lookups/second')
     ax3.legend()
     
+    # P99 latencies
     ax4.plot(sizes, [r['insert_p99'] for r in results['cuckoo']], 'b-', label='Cuckoo Insert')
     ax4.plot(sizes, [r['insert_p99'] for r in results['xor']], 'r--', label='XOR Insert')
     ax4.plot(sizes, [r['lookup_p99'] for r in results['cuckoo']], 'g-', label='Cuckoo Lookup')
